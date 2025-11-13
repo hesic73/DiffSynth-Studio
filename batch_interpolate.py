@@ -2,7 +2,7 @@
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -42,6 +42,89 @@ _DEFAULT_PROMPT = (
     "white waves crash against the hull, but the boat fearlessly sails steadily towards the distance. "
     "Sunlight shines on the water surface, sparkling with golden light, adding a touch of warmth to this magnificent scene."
 )
+
+
+def parse_ranges(ranges_str: str | None) -> List[Tuple[int | None, int | None]]:
+    """Parse range specification string into list of (start, end) tuples."""
+    if not ranges_str:
+        return [(None, None)]
+
+    ranges = []
+    for range_part in ranges_str.split(','):
+        range_part = range_part.strip()
+        if ':' not in range_part:
+            raise ValueError(f"Invalid range format: {range_part}. Expected 'start:end'")
+
+        start_str, end_str = range_part.split(':', 1)
+        start = int(start_str.strip()) if start_str.strip() else None
+        end_val = end_str.strip()
+
+        if end_val == '-1' or end_val == '':
+            end = None
+        else:
+            end = int(end_val)
+
+        ranges.append((start, end))
+
+    return ranges
+
+
+def in_ranges(clip_id: int, ranges: List[Tuple[int | None, int | None]]) -> bool:
+    """Check if a clip_id falls within any of the specified ranges."""
+    if ranges == [(None, None)]:
+        return True
+
+    for start, end in ranges:
+        in_range = True
+        if start is not None and clip_id < start:
+            in_range = False
+        if end is not None and clip_id >= end:
+            in_range = False
+        if in_range:
+            return True
+
+    return False
+
+
+def find_pending_clips(
+    clip_base: Path,
+    output_base: Path,
+    ranges: List[Tuple[int | None, int | None]] | None = None,
+    skip_existing: bool = True,
+    descending: bool = False,
+) -> List[int]:
+    """Find clip IDs that need processing based on range and existence filters."""
+    if ranges is None:
+        ranges = [(None, None)]
+
+    all_clips = [d for d in clip_base.iterdir() if d.is_dir()]
+
+    # Build list of (clip_id, clip_path) tuples for proper numeric sorting
+    clip_tuples = []
+    for clip_path in all_clips:
+        try:
+            clip_id = int(clip_path.name)
+            clip_tuples.append((clip_id, clip_path))
+        except ValueError:
+            continue
+
+    # Sort by clip_id (numeric)
+    clip_tuples.sort(key=lambda x: x[0], reverse=descending)
+
+    # Filter by range and existence
+    pending = []
+    for clip_id, clip_path in clip_tuples:
+        if not in_ranges(clip_id, ranges):
+            continue
+
+        if skip_existing:
+            output_path = output_base / f"{clip_id}.mp4"
+            if output_path.exists():
+                continue
+
+        pending.append(clip_id)
+
+    return pending
 
 
 def _read_specific_frames(path: Path, indices: Sequence[int]) -> Dict[int, np.ndarray]:
@@ -131,12 +214,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Batch video frame interpolation")
     parser.add_argument("--clip-base", type=Path, required=True,
                         help="Base directory containing numbered clip subdirectories")
-    parser.add_argument("--clip-start", type=int, required=True,
-                        help="Start clip ID (inclusive)")
-    parser.add_argument("--clip-end", type=int, required=True,
-                        help="End clip ID (exclusive)")
     parser.add_argument("--output-base", type=Path, required=True,
                         help="Base output directory")
+    parser.add_argument("--ranges", type=str, default=None,
+                        help="Comma-separated ranges (e.g., '100:200,250:-1'). Use -1 for open-ended.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing output videos. By default, existing videos are skipped.")
+    parser.add_argument("--descending", action="store_true",
+                        help="Process clips in descending order by ID. By default, processes in ascending order.")
     parser.add_argument("--prompt", type=str, default=_DEFAULT_PROMPT,
                         help="Prompt for generation")
     parser.add_argument("--start-frame", type=int, default=0,
@@ -161,17 +246,50 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Validate paths
+    clip_base = args.clip_base.expanduser().resolve()
+    output_base = args.output_base.expanduser().resolve()
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    # Parse ranges
+    parsed_ranges = parse_ranges(args.ranges) if args.ranges else None
+
     # Print configuration
     console.print("\n[bold cyan]═" * 30)
     console.print("[bold cyan]Wan Video Frame Interpolation")
     console.print("[bold cyan]═" * 30)
-    console.print(f"[cyan]Clip base:[/cyan] {args.clip_base}")
-    console.print(f"[cyan]Output:[/cyan] {args.output_base}")
-    console.print(f"[cyan]Clip range:[/cyan] {args.clip_start} to {args.clip_end-1}")
+    console.print(f"[cyan]Clip base:[/cyan] {clip_base}")
+    console.print(f"[cyan]Output:[/cyan] {output_base}")
+
+    # Show range info
+    if parsed_ranges and parsed_ranges != [(None, None)]:
+        ranges_str = ", ".join([f"[{s if s is not None else '0'}:{e if e is not None else '∞'})" for s, e in parsed_ranges])
+        console.print(f"[cyan]Range filter:[/cyan] {ranges_str}")
+    if args.overwrite:
+        console.print(f"[yellow]Overwrite mode:[/yellow] enabled (will reprocess existing)")
+    else:
+        console.print(f"[cyan]Skip existing:[/cyan] enabled (default)")
+
+    order_str = "descending" if args.descending else "ascending"
+    console.print(f"[cyan]Processing order:[/cyan] {order_str}")
+
     console.print(f"[cyan]Frame range:[/cyan] {args.start_frame} to {args.end_frame}")
     console.print(f"[cyan]Intermediate frames:[/cyan] {args.num_intermediate_frames}")
     console.print(f"[cyan]Device:[/cyan] {args.device}")
     console.print("[bold cyan]═" * 30 + "\n")
+
+    # Find pending clips
+    console.print("[bold cyan]Scanning for clips to process...[/bold cyan]")
+    skip_existing = not args.overwrite
+    pending_clips = find_pending_clips(
+        clip_base, output_base, ranges=parsed_ranges, skip_existing=skip_existing, descending=args.descending
+    )
+
+    if not pending_clips:
+        console.print(f"[green]No clips to process. All clips already exist![/green]")
+        return
+
+    console.print(f"[bold]Found {len(pending_clips)} clips to process[/bold]\n")
 
     # Load model
     console.print("[yellow]Loading model...[/yellow]")
@@ -186,10 +304,8 @@ def main():
     pipe.enable_vram_management()
     console.print("[green]✓ Model loaded successfully[/green]\n")
 
-    args.output_base.mkdir(parents=True, exist_ok=True)
-
     # Initialize statistics
-    total_clips = args.clip_end - args.clip_start
+    total_clips = len(pending_clips)
     completed_count = 0
     failed_count = 0
     start_time = time.time()
@@ -209,9 +325,9 @@ def main():
     with Live(console=console, refresh_per_second=4) as live:
         clip_task = clip_progress.add_task("Processing Clips", total=total_clips)
 
-        for clip_id in range(args.clip_start, args.clip_end):
-            clip_folder = args.clip_base / str(clip_id)
-            output_path = args.output_base / f"{clip_id}.mp4"
+        for clip_id in pending_clips:
+            clip_folder = clip_base / str(clip_id)
+            output_path = output_base / f"{clip_id}.mp4"
 
             # Update display
             current_status = create_status_table(
@@ -270,7 +386,7 @@ def main():
     summary.append(f"Total clips:     {total_clips}\n", style="bold")
     summary.append(f"✓ Successful:    {completed_count}\n", style="bold green")
     summary.append(f"✗ Failed:        {failed_count}\n", style="bold red")
-    summary.append(f"\nOutput directory: {args.output_base}\n", style="cyan")
+    summary.append(f"\nOutput directory: {output_base}\n", style="cyan")
 
     border_style = "green" if failed_count == 0 else "yellow"
     console.print(Panel(summary, border_style=border_style, title="Summary"))
