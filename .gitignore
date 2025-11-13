@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+*.safetensors
+*.pth
+
+.mv
+.msc
+*.model
+*.json
+*.mp4

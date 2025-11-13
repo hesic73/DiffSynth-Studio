@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import logging
+import time
 from pathlib import Path
 from typing import Dict, Sequence
 
@@ -8,11 +8,23 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+from rich.text import Text
 
 from diffsynth import save_video
 from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+console = Console()
 
 _MODEL_CONFIGS = [
     ModelConfig(model_id="PAI/Wan2.1-Fun-V1.1-1.3B-InP",
@@ -82,6 +94,39 @@ def load_start_end_images(clip_folder: Path, start_frame: int, end_frame: int):
     return _bgr_to_pil(frames[start_frame]), _bgr_to_pil(frames[end_frame])
 
 
+def create_status_table(
+    total_clips: int,
+    completed: int,
+    failed: int,
+    current_clip: str,
+    elapsed_time: float,
+) -> Table:
+    """Create a status table with overall statistics."""
+    table = Table(title="Processing Status", show_header=False, box=None)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="bold")
+
+    remaining = total_clips - completed - failed
+    table.add_row("Total Clips", f"{total_clips}")
+    table.add_row("✓ Completed", f"[green]{completed}[/green]")
+    table.add_row("✗ Failed", f"[red]{failed}[/red]")
+    table.add_row("⏳ Remaining", f"[yellow]{remaining}[/yellow]")
+
+    if current_clip:
+        table.add_row("Current", f"[bold cyan]{current_clip}[/bold cyan]")
+
+    elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
+    table.add_row("Elapsed", f"[cyan]{elapsed_str}[/cyan]")
+
+    if completed > 0:
+        avg_time = elapsed_time / completed
+        eta_seconds = avg_time * remaining
+        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
+        table.add_row("ETA", f"[cyan]{eta_str}[/cyan]")
+
+    return table
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Batch video frame interpolation")
     parser.add_argument("--clip-base", type=Path, required=True,
@@ -116,6 +161,20 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Print configuration
+    console.print("\n[bold cyan]═" * 30)
+    console.print("[bold cyan]Wan Video Frame Interpolation")
+    console.print("[bold cyan]═" * 30)
+    console.print(f"[cyan]Clip base:[/cyan] {args.clip_base}")
+    console.print(f"[cyan]Output:[/cyan] {args.output_base}")
+    console.print(f"[cyan]Clip range:[/cyan] {args.clip_start} to {args.clip_end-1}")
+    console.print(f"[cyan]Frame range:[/cyan] {args.start_frame} to {args.end_frame}")
+    console.print(f"[cyan]Intermediate frames:[/cyan] {args.num_intermediate_frames}")
+    console.print(f"[cyan]Device:[/cyan] {args.device}")
+    console.print("[bold cyan]═" * 30 + "\n")
+
+    # Load model
+    console.print("[yellow]Loading model...[/yellow]")
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map[args.torch_dtype.lower()]
 
@@ -125,36 +184,96 @@ def main():
         model_configs=_MODEL_CONFIGS,
     )
     pipe.enable_vram_management()
+    console.print("[green]✓ Model loaded successfully[/green]\n")
 
     args.output_base.mkdir(parents=True, exist_ok=True)
 
-    for clip_id in range(args.clip_start, args.clip_end):
-        clip_folder = args.clip_base / str(clip_id)
-        if not clip_folder.is_dir():
-            logging.warning(f"Skipping: {clip_folder} not found")
-            continue
+    # Initialize statistics
+    total_clips = args.clip_end - args.clip_start
+    completed_count = 0
+    failed_count = 0
+    start_time = time.time()
 
-        output_path = args.output_base / f"{clip_id}.mp4"
-        logging.info(f"Processing clip {clip_id} -> {output_path}")
+    # Create progress bar
+    clip_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(complete_style="green", finished_style="green"),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeElapsedColumn(),
+        console=console,
+    )
 
-        start_image, end_image = load_start_end_images(clip_folder, args.start_frame, args.end_frame)
-        height, width = start_image.height, start_image.width
-        num_frames = args.num_intermediate_frames + 2
+    # Process clips with live display
+    with Live(console=console, refresh_per_second=4) as live:
+        clip_task = clip_progress.add_task("Processing Clips", total=total_clips)
 
-        video = pipe(
-            prompt=args.prompt,
-            negative_prompt="",
-            input_image=start_image,
-            end_image=end_image,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            seed=args.seed,
-            tiled=True,
-        )
+        for clip_id in range(args.clip_start, args.clip_end):
+            clip_folder = args.clip_base / str(clip_id)
+            output_path = args.output_base / f"{clip_id}.mp4"
 
-        save_video(video, str(output_path), fps=args.fps, quality=args.quality)
-        logging.info(f"Saved: {output_path}")
+            # Update display
+            current_status = create_status_table(
+                total_clips=total_clips,
+                completed=completed_count,
+                failed=failed_count,
+                current_clip=str(clip_id),
+                elapsed_time=time.time() - start_time,
+            )
+
+            display_group = Table.grid()
+            display_group.add_row(Panel(current_status, border_style="blue"))
+            display_group.add_row(clip_progress)
+            live.update(display_group)
+
+            # Check if clip folder exists
+            if not clip_folder.is_dir():
+                failed_count += 1
+                clip_progress.update(clip_task, advance=1)
+                continue
+
+            try:
+                start_image, end_image = load_start_end_images(clip_folder, args.start_frame, args.end_frame)
+                height, width = start_image.height, start_image.width
+                num_frames = args.num_intermediate_frames + 2
+
+                video = pipe(
+                    prompt=args.prompt,
+                    negative_prompt="",
+                    input_image=start_image,
+                    end_image=end_image,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    seed=args.seed,
+                    tiled=True,
+                )
+
+                save_video(video, str(output_path), fps=args.fps, quality=args.quality)
+                completed_count += 1
+
+            except Exception as exc:
+                failed_count += 1
+                console.print(f"[red]✗ ERROR processing clip {clip_id}: {exc}[/red]")
+
+            clip_progress.update(clip_task, advance=1)
+
+    # Final summary
+    elapsed_time = time.time() - start_time
+    elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
+
+    summary = Text()
+    summary.append("\n")
+    summary.append("PROCESSING COMPLETE\n\n", style="bold green")
+    summary.append(f"Total time:      {elapsed_str}\n", style="cyan")
+    summary.append(f"Total clips:     {total_clips}\n", style="bold")
+    summary.append(f"✓ Successful:    {completed_count}\n", style="bold green")
+    summary.append(f"✗ Failed:        {failed_count}\n", style="bold red")
+    summary.append(f"\nOutput directory: {args.output_base}\n", style="cyan")
+
+    border_style = "green" if failed_count == 0 else "yellow"
+    console.print(Panel(summary, border_style=border_style, title="Summary"))
 
 
 if __name__ == "__main__":

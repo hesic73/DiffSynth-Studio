@@ -13,3 +13,5 @@ pynvml
 pandas
 accelerate
 peft
+rich
+opencv-python
