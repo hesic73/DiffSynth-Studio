@@ -37,11 +37,7 @@ _MODEL_CONFIGS = [
                 origin_file_pattern="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", offload_device="cpu"),
 ]
 
-_DEFAULT_PROMPT = (
-    "A small boat bravely rides the wind and waves forward. The azure sea is turbulent, "
-    "white waves crash against the hull, but the boat fearlessly sails steadily towards the distance. "
-    "Sunlight shines on the water surface, sparkling with golden light, adding a touch of warmth to this magnificent scene."
-)
+_DEFAULT_PROMPT = "A car is driving on the road."
 
 
 def parse_ranges(ranges_str: str | None) -> List[Tuple[int | None, int | None]]:

@@ -475,7 +475,7 @@ def parse_args():
     parser.add_argument("--gpus", type=str, default=None,
                         help="Comma-separated GPU IDs (e.g., '0,1,2,3'). If not specified, uses all available GPUs.")
     parser.add_argument("--prompt", type=str,
-                        default="A small boat bravely rides the wind and waves forward.",
+                        default="A car is driving on the road.",
                         help="Prompt for generation")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="Start frame index (default: 0)")
